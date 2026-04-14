@@ -1,0 +1,85 @@
+mkdir -p ~/yolo_test
+cd ~/yolo_test
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip wheel setuptools
+
+python -m pip install ultralytics
+yolo version
+python -c "from ultralytics import YOLO; print('ultralytics ok')"
+
+cd ~/yolo_test
+source .venv/bin/activate
+nano live_detect_mjpeg.py
+
+from ultralytics import YOLO
+import cv2
+from datetime import datetime
+from pathlib import Path
+
+STREAM_URL = "http://127.0.0.1:8000/stream.mjpg"
+MODEL_PATH = "yolo11n.pt"
+
+SAVE_DIR = Path.home() / "yolo_test" / "detections"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+CONF = 0.25
+IMG_SIZE = 640
+SAVE_EVERY_N_SECONDS = 3
+
+model = YOLO(MODEL_PATH)
+cap = cv2.VideoCapture(STREAM_URL)
+
+if not cap.isOpened():
+    raise RuntimeError(f"Could not open stream: {STREAM_URL}")
+
+print("Live detection started.")
+print("Watching stream:", STREAM_URL)
+print("Press Ctrl+C to stop.")
+
+last_save_time = 0
+
+try:
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        results = model.predict(
+            source=frame,
+            conf=CONF,
+            imgsz=IMG_SIZE,
+            verbose=False
+        )
+
+        r = results[0]
+        boxes = r.boxes
+
+        if boxes is not None and len(boxes) > 0:
+            names_seen = []
+            for cls_id, conf in zip(boxes.cls.tolist(), boxes.conf.tolist()):
+                cls_name = model.names[int(cls_id)]
+                names_seen.append(f"{cls_name} ({conf:.2f})")
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] detected: " + ", ".join(names_seen))
+
+            now = datetime.now().timestamp()
+            if now - last_save_time >= SAVE_EVERY_N_SECONDS:
+                annotated = r.plot()
+                out = SAVE_DIR / f"detect_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                cv2.imwrite(str(out), annotated)
+                print(f"Saved: {out}")
+                last_save_time = now
+
+except KeyboardInterrupt:
+    print("\nStopped.")
+finally:
+    cap.release()
+
+cd ~/yolo_test
+source .venv/bin/activate
+python live_detect_mjpeg.py
+
+
