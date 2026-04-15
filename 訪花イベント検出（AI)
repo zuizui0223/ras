@@ -4,7 +4,7 @@ import csv
 import time
 from datetime import datetime
 
-from picamera2 import Picamera2
+from picamera2 import Picamera2, Preview
 from picamera2.devices import IMX500
 from picamera2.devices.imx500 import NetworkIntrinsics
 from picamera2.encoders import H264Encoder
@@ -28,7 +28,7 @@ MODEL_PATH = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_32
 # Camera / recording settings
 # =========================
 MAIN_SIZE = (1280, 720)
-RECORD_SECONDS = 5
+RECORD_SECONDS = 10
 COOLDOWN_SECONDS = 3
 BITRATE = 10_000_000
 
@@ -91,7 +91,7 @@ def parse_detections(imx500, intrinsics, metadata, picam2):
     global last_detections
 
     np_outputs = imx500.get_outputs(metadata, add_batch=True)
-    input_w, input_h = imx500.get_input_size()
+    _, input_h = imx500.get_input_size()
 
     if np_outputs is None:
         return last_detections
@@ -148,6 +148,11 @@ def main():
     intrinsics.update_with_defaults()
 
     picam2 = Picamera2(imx500.camera_num)
+
+    # Preview window:
+    # works only in local desktop / VNC desktop session, not plain SSH/Termius
+    picam2.start_preview(Preview.QT)
+
     config = picam2.create_preview_configuration(
         main={"size": MAIN_SIZE},
         controls={"FrameRate": intrinsics.inference_rate},
@@ -156,6 +161,7 @@ def main():
 
     imx500.show_network_fw_progress_bar()
     picam2.start(config)
+
     if intrinsics.preserve_aspect_ratio:
         imx500.set_auto_aspect_ratio()
 
@@ -166,6 +172,7 @@ def main():
     print(f"Saving events to: {SAVE_DIR}")
     print(f"CSV log: {CSV_PATH}")
     print(f"ROI: {roi}")
+    print("Preview window should be visible on desktop/VNC")
     print("Press Ctrl+C to stop")
 
     positive_count = 0
@@ -228,6 +235,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
+        picam2.stop_preview()
         picam2.stop()
 
 
