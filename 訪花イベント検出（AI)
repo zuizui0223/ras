@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+import os
+import csv
+import time
+from datetime import datetime
+
+from picamera2 import Picamera2
+from picamera2.devices import IMX500
+from picamera2.devices.imx500 import NetworkIntrinsics
+from picamera2.encoders import H264Encoder
+from picamera2.outputs import FileOutput
+
+# =========================
+# Paths
+# =========================
+BASE_DIR = os.path.expanduser("~/ai_visit_detect")
+SAVE_DIR = os.path.join(BASE_DIR, "events")
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+CSV_PATH = os.path.join(BASE_DIR, "event_log.csv")
+
+# =========================
+# Model
+# =========================
+MODEL_PATH = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
+
+# =========================
+# Camera / recording settings
+# =========================
+MAIN_SIZE = (1280, 720)
+RECORD_SECONDS = 5
+COOLDOWN_SECONDS = 3
+BITRATE = 10_000_000
+
+# =========================
+# ROI in preview image coordinates
+# =========================
+ROI = (240, 140, 420, 320)
+
+# =========================
+# Detection settings
+# =========================
+MIN_CONFIDENCE = 0.35
+CONSECUTIVE_FRAMES_REQUIRED = 2
+TARGET_CLASSES = None
+# 例:
+# TARGET_CLASSES = {"person", "bird"}
+
+last_detections = []
+
+
+def now_str():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def ensure_csv_header():
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "video_file",
+                "class_name",
+                "confidence",
+                "bbox_x",
+                "bbox_y",
+                "bbox_w",
+                "bbox_h",
+                "roi_x1",
+                "roi_y1",
+                "roi_x2",
+                "roi_y2"
+            ])
+
+
+def append_csv(row):
+    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
+
+
+def box_intersects_roi(box, roi):
+    bx, by, bw, bh = box
+    x1, y1, x2, y2 = roi
+    bx2 = bx + bw
+    by2 = by + bh
+    return not (bx2 < x1 or bx > x2 or by2 < y1 or by > y2)
+
+
+def parse_detections(imx500, intrinsics, metadata, picam2):
+    global last_detections
+
+    np_outputs = imx500.get_outputs(metadata, add_batch=True)
+    input_w, input_h = imx500.get_input_size()
+
+    if np_outputs is None:
+        return last_detections
+
+    # SSD-style outputs: boxes, scores, classes
+    boxes, scores, classes = np_outputs[0][0], np_outputs[1][0], np_outputs[2][0]
+
+    if intrinsics.bbox_normalization:
+        boxes = boxes / input_h
+
+    if intrinsics.bbox_order == "xy":
+        boxes = boxes[:, [1, 0, 3, 2]]
+
+    detections = []
+    labels = intrinsics.labels or []
+
+    for box, score, category in zip(boxes, scores, classes):
+        score = float(score)
+        if score < MIN_CONFIDENCE:
+            continue
+
+        coords = imx500.convert_inference_coords(box, metadata, picam2)
+        if coords is None:
+            continue
+
+        x, y, w, h = [int(v) for v in coords]
+
+        class_id = int(category)
+        class_name = str(class_id)
+        if 0 <= class_id < len(labels):
+            class_name = labels[class_id]
+
+        if TARGET_CLASSES is not None and class_name not in TARGET_CLASSES:
+            continue
+
+        detections.append({
+            "class_name": class_name,
+            "confidence": score,
+            "box": (x, y, w, h),
+        })
+
+    last_detections = detections
+    return detections
+
+
+def main():
+    ensure_csv_header()
+
+    imx500 = IMX500(MODEL_PATH)
+    intrinsics = imx500.network_intrinsics
+    if not intrinsics:
+        intrinsics = NetworkIntrinsics()
+        intrinsics.task = "object detection"
+    intrinsics.update_with_defaults()
+
+    picam2 = Picamera2(imx500.camera_num)
+    config = picam2.create_preview_configuration(
+        main={"size": MAIN_SIZE},
+        controls={"FrameRate": intrinsics.inference_rate},
+        buffer_count=12
+    )
+
+    imx500.show_network_fw_progress_bar()
+    picam2.start(config)
+    if intrinsics.preserve_aspect_ratio:
+        imx500.set_auto_aspect_ratio()
+
+    time.sleep(2)
+
+    roi = ROI
+    print("AI ROI visit detector started")
+    print(f"Saving events to: {SAVE_DIR}")
+    print(f"CSV log: {CSV_PATH}")
+    print(f"ROI: {roi}")
+    print("Press Ctrl+C to stop")
+
+    positive_count = 0
+    cooldown_until = 0
+
+    try:
+        while True:
+            metadata = picam2.capture_metadata()
+            detections = parse_detections(imx500, intrinsics, metadata, picam2)
+
+            last_hit = None
+            for det in detections:
+                if box_intersects_roi(det["box"], roi):
+                    last_hit = det
+                    break
+
+            if last_hit is not None:
+                positive_count += 1
+                print(
+                    f"[HIT] class={last_hit['class_name']} "
+                    f"conf={last_hit['confidence']:.2f} "
+                    f"box={last_hit['box']} pos={positive_count}"
+                )
+            else:
+                positive_count = 0
+
+            now = time.time()
+            triggered = (
+                last_hit is not None and
+                positive_count >= CONSECUTIVE_FRAMES_REQUIRED and
+                now >= cooldown_until
+            )
+
+            if triggered:
+                ts = now_str()
+                out_h264 = os.path.join(SAVE_DIR, f"visit_{ts}.h264")
+
+                print(f"[TRIGGER] recording {out_h264}")
+
+                encoder = H264Encoder(BITRATE)
+                picam2.start_encoder(encoder, FileOutput(out_h264))
+                time.sleep(RECORD_SECONDS)
+                picam2.stop_encoder()
+
+                print(f"[SAVED] {out_h264}")
+
+                bx, by, bw, bh = last_hit["box"]
+                append_csv([
+                    ts,
+                    out_h264,
+                    last_hit["class_name"],
+                    round(last_hit["confidence"], 3),
+                    bx, by, bw, bh,
+                    roi[0], roi[1], roi[2], roi[3]
+                ])
+
+                cooldown_until = time.time() + COOLDOWN_SECONDS
+                positive_count = 0
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    finally:
+        picam2.stop()
+
+
+if __name__ == "__main__":
+    main()
